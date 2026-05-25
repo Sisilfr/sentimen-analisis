@@ -1,8 +1,9 @@
-streamlit>=1.36.0
-pandas>=2.2.0
-numpy>=1.26.0
-torch>=2.2.0
-transformers>=4.41.0
-openpyxl>=3.1.0
-sentencepiece>=0.2.0
-safetensors>=0.4.0
+streamlit==1.36.0
+pandas==2.2.2
+numpy==1.26.4
+torch==2.2.2
+transformers==4.41.2
+openpyxl==3.1.2
+sentencepiece==0.2.0
+safetensors==0.4.3
+requests==2.32.3
