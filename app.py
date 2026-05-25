@@ -5,8 +5,9 @@ import time
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -17,16 +18,18 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 # =========================================================
-# CONFIG
+# BASIC CONFIG
 # =========================================================
 st.set_page_config(
     page_title="Sentiment Analysis Perbankan Indonesia",
     page_icon="📊",
-    layout="centered",
+    layout="wide",
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+torch.set_num_threads(1)
 
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_ID2LABEL = {
@@ -40,12 +43,16 @@ SUPPORTED_TEXT_COLUMNS = [
     "tweet", "caption", "news", "body", "title"
 ]
 
-# hanya file yang benar-benar penting
+CACHE_ROOT = Path("/tmp/streamlit_mlflow_cache")
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+# file minimal saja agar first load lebih cepat
 REQUIRED_MODEL_FILES = [
     "multitask_model.pt",
+]
+OPTIONAL_CONFIG_FILES = [
     "config_runtime.json",
 ]
-
 OPTIONAL_TOKENIZER_FILES = [
     "tokenizer.json",
     "tokenizer_config.json",
@@ -55,9 +62,6 @@ OPTIONAL_TOKENIZER_FILES = [
     "sentencepiece.bpe.model",
     "added_tokens.json",
 ]
-
-CACHE_ROOT = Path("/tmp/streamlit_mlflow_cache")
-CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 # =========================================================
 # SECRETS
@@ -84,7 +88,7 @@ def get_required_config() -> Dict[str, str]:
     return cfg
 
 # =========================================================
-# HTTP / MLFLOW REST
+# HTTP / MLFLOW REST LIGHT CLIENT
 # =========================================================
 def build_session(username: str, token: str) -> requests.Session:
     s = requests.Session()
@@ -92,16 +96,18 @@ def build_session(username: str, token: str) -> requests.Session:
     s.headers.update({"User-Agent": "streamlit-mlflow-rest-client/1.0"})
     return s
 
-def get_run_info(session: requests.Session, tracking_uri: str, run_id: str) -> Dict:
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_run_artifact_base(tracking_uri: str, username: str, token: str, run_id: str) -> str:
+    session = build_session(username, token)
     url = f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/runs/get"
-    resp = session.get(url, params={"run_id": run_id}, timeout=30)
+    resp = session.get(url, params={"run_id": run_id}, timeout=20)
     resp.raise_for_status()
     payload = resp.json()
+
     if "run" not in payload:
         raise RuntimeError(f"Response MLflow invalid: {payload}")
-    return payload["run"]
 
-def artifact_uri_to_http_base(tracking_uri: str, artifact_uri: str) -> str:
+    artifact_uri = payload["run"]["info"]["artifact_uri"]
     base = tracking_uri.rstrip("/")
 
     if artifact_uri.startswith("mlflow-artifacts:/"):
@@ -121,7 +127,7 @@ def download_file_if_exists(
     session: requests.Session,
     url: str,
     dst_path: Path,
-    timeout: int = 60,
+    timeout: int = 120,
 ) -> bool:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -129,14 +135,13 @@ def download_file_if_exists(
         return True
 
     resp = session.get(url, stream=True, timeout=timeout)
-
     if resp.status_code == 404:
         return False
     resp.raise_for_status()
 
     tmp_path = dst_path.with_suffix(dst_path.suffix + ".part")
     with open(tmp_path, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 512):
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
 
@@ -149,45 +154,71 @@ def download_file_if_exists(
 
 def prepare_model_from_mlflow_rest(force_refresh: bool = False) -> Path:
     cfg = get_required_config()
-    session = build_session(cfg["dagshub_username"], cfg["dagshub_token"])
-
     cache_dir = CACHE_ROOT / cfg["run_id"] / cfg["artifact_path"].strip("/")
     marker = cache_dir / ".ready"
 
     if marker.exists() and not force_refresh:
         return cache_dir
 
-    run = get_run_info(
-        session=session,
+    if force_refresh and cache_dir.exists():
+        for p in cache_dir.glob("*"):
+            if p.is_file():
+                p.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+
+    artifact_root_http = get_run_artifact_base(
         tracking_uri=cfg["tracking_uri"],
+        username=cfg["dagshub_username"],
+        token=cfg["dagshub_token"],
         run_id=cfg["run_id"],
     )
 
-    artifact_uri = run["info"]["artifact_uri"]
-    artifact_root_http = artifact_uri_to_http_base(cfg["tracking_uri"], artifact_uri)
+    session = build_session(cfg["dagshub_username"], cfg["dagshub_token"])
     artifact_path = cfg["artifact_path"].strip("/")
-
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # download file wajib
+    tasks = []
+
+    # wajib
     for fname in REQUIRED_MODEL_FILES:
         remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
         local_file = cache_dir / fname
-        ok = download_file_if_exists(session, remote_url, local_file)
-        if not ok:
-            raise FileNotFoundError(f"File wajib tidak ditemukan di artifact: {fname}")
+        tasks.append(("required", fname, remote_url, local_file))
 
-    # download tokenizer file kalau ada
+    # optional config
+    for fname in OPTIONAL_CONFIG_FILES:
+        remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
+        local_file = cache_dir / fname
+        tasks.append(("optional", fname, remote_url, local_file))
+
+    # tokenizer optional — kalau tidak ada, fallback ke HF
     for fname in OPTIONAL_TOKENIZER_FILES:
         remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
         local_file = cache_dir / fname
-        download_file_if_exists(session, remote_url, local_file)
+        tasks.append(("tokenizer", fname, remote_url, local_file))
+
+    results = {}
+
+    def _job(kind: str, fname: str, remote_url: str, local_file: Path):
+        ok = download_file_if_exists(session, remote_url, local_file)
+        return kind, fname, ok
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [ex.submit(_job, kind, fname, remote_url, local_file) for kind, fname, remote_url, local_file in tasks]
+        for fut in as_completed(futures):
+            kind, fname, ok = fut.result()
+            results[(kind, fname)] = ok
+
+    # validasi file wajib
+    for fname in REQUIRED_MODEL_FILES:
+        if not results.get(("required", fname), False):
+            raise FileNotFoundError(f"File wajib tidak ditemukan di artifact MLflow: {fname}")
 
     marker.write_text("ok", encoding="utf-8")
     return cache_dir
 
 # =========================================================
-# PREPROCESSOR
+# PREPROCESSING
 # =========================================================
 class TextPreprocessor:
     def normalize_unicode(self, text: str) -> str:
@@ -277,7 +308,7 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
     num_labels = int(runtime_config.get("num_labels", 3))
     dropout_prob = float(runtime_config.get("dropout_prob", 0.1))
 
-    # tokenizer lokal kalau lengkap, fallback ke HF
+    # tokenizer lokal kalau lengkap, kalau tidak fallback ke base model
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
     except Exception:
@@ -346,12 +377,17 @@ class SentimentEngine:
         pred_label = self.id2label.get(pred_idx, str(pred_idx))
         confidence = float(probs[pred_idx].item() * 100.0)
 
+        # sentiment score
+        score_tensor = torch.tensor([5.0, 0.0, -5.0], device=self.bundle.device)
+        sentiment_score = float(torch.dot(probs, score_tensor).item())
+
         result = {
             "task_key": task_name,
             "raw_text": text,
             "clean_text": clean_text,
             "pred_label": pred_label,
             "confidence": round(confidence, 4),
+            "sentiment_score": round(sentiment_score, 4),
             "token_length": int(input_ids.shape[1]),
         }
 
@@ -405,115 +441,130 @@ def load_engine_cached(model_dir_str: str):
     return SentimentEngine(bundle)
 
 # =========================================================
-# UI
+# MAIN UI
 # =========================================================
 def main():
-    st.title("📊 Sentiment Analysis Perbankan Indonesia")
-    st.caption("Model dari MLflow run via secrets, tanpa menampilkan token atau run_id.")
+    st.title("🎯 Sentiment Analysis Perbankan Indonesia")
+    st.markdown("Inference model IndoBERT multitask multisource untuk **news** dan **sosmed**.")
+    st.markdown("Model diambil dari MLflow/DagsHub via **Streamlit secrets**, tanpa menampilkan token atau run_id.")
 
-    if "model_dir" not in st.session_state:
-        st.session_state["model_dir"] = None
-    if "engine_ready" not in st.session_state:
-        st.session_state["engine_ready"] = False
+    st.sidebar.header("🔧 Model Configuration")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔄 Load Model", type="primary"):
-            try:
-                t0 = time.time()
-                with st.spinner("Mengunduh / menyiapkan model..."):
-                    model_dir = prepare_model_from_mlflow_rest(force_refresh=False)
-                    st.session_state["model_dir"] = str(model_dir)
-                    st.session_state["engine_ready"] = True
-                st.success(f"Model siap. Waktu persiapan: {time.time() - t0:.1f} detik")
-            except Exception as e:
-                st.error(f"Gagal load model: {e}")
-                st.stop()
+    if st.sidebar.button("🔄 Load / Reload Model"):
+        try:
+            t0 = time.time()
+            with st.spinner("Menyiapkan model dari MLflow..."):
+                model_dir = prepare_model_from_mlflow_rest(force_refresh=True)
+                st.session_state["model_dir"] = str(model_dir)
+                st.session_state["models_loaded"] = True
+                load_engine_cached.clear()
+            st.sidebar.success(f"✅ Model loaded in {time.time() - t0:.1f}s")
+        except Exception as e:
+            st.sidebar.error(f"❌ Error loading model: {e}")
+            st.session_state["models_loaded"] = False
 
-    with col2:
-        if st.button("♻️ Refresh Model"):
-            try:
-                t0 = time.time()
-                with st.spinner("Refresh model dari MLflow..."):
-                    model_dir = prepare_model_from_mlflow_rest(force_refresh=True)
-                    st.session_state["model_dir"] = str(model_dir)
-                    st.session_state["engine_ready"] = True
-                    load_engine_cached.clear()
-                st.success(f"Model direfresh. Waktu: {time.time() - t0:.1f} detik")
-            except Exception as e:
-                st.error(f"Gagal refresh model: {e}")
-
-    if not st.session_state["engine_ready"] or not st.session_state["model_dir"]:
-        st.info("Klik **Load Model** dulu. Setelah itu inference akan jauh lebih cepat.")
-        st.stop()
+    if "models_loaded" not in st.session_state or not st.session_state["models_loaded"]:
+        st.warning("⚠️ Klik **Load / Reload Model** di sidebar dulu.")
+        st.info("Model hanya akan diunduh sekali lalu disimpan di cache lokal agar penggunaan berikutnya lebih cepat.")
+        return
 
     try:
         engine = load_engine_cached(st.session_state["model_dir"])
     except Exception as e:
         st.error(f"Gagal inisialisasi engine: {e}")
-        st.stop()
+        return
 
-    st.divider()
-    st.subheader("Single Inference")
+    tab1, tab2 = st.tabs(["📝 Single Text", "📊 Batch Processing"])
 
-    task_name = st.radio("Pilih task", ["news", "sosmed"], horizontal=True)
-    input_text = st.text_area("Masukkan teks", height=180)
+    with tab1:
+        st.header("Single Text Analysis")
 
-    if st.button("🔍 Predict"):
-        if not input_text.strip():
-            st.warning("Teks belum diisi.")
-        else:
-            result = engine.predict_one(input_text, task_name)
-            st.write(f"**Label:** {result['pred_label']}")
-            st.write(f"**Confidence:** {result['confidence']:.2f}%")
+        task_name = st.radio("Pilih task", ["news", "sosmed"], horizontal=True)
+        input_text = st.text_area(
+            "Masukkan teks untuk analisis sentimen:",
+            placeholder="Type your text here...",
+            height=140
+        )
 
-            prob_df = pd.DataFrame({
-                "label": [k.replace("prob_", "") for k in result if k.startswith("prob_")],
-                "probability": [result[k] for k in result if k.startswith("prob_")]
-            })
-            st.dataframe(prob_df, use_container_width=True, hide_index=True)
+        if st.button("🔍 Analyze", type="primary"):
+            if input_text.strip():
+                with st.spinner("Processing..."):
+                    result = engine.predict_one(input_text, task_name)
 
-    st.divider()
-    st.subheader("Batch Inference")
+                st.subheader("🔸 Model Results")
+                col1, col2 = st.columns(2)
 
-    uploaded_file = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx", "xls"])
-    if uploaded_file is not None:
-        try:
-            if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file)
+                with col1:
+                    st.metric("Label", result["pred_label"])
+                    st.metric("Confidence", f"{result['confidence']:.2f}%")
+
+                with col2:
+                    st.metric("Sentiment Score", f"{result['sentiment_score']:.3f}")
+                    st.metric("Token Length", result["token_length"])
+
+                prob_df = pd.DataFrame({
+                    "label": [k.replace("prob_", "") for k in result if k.startswith("prob_")],
+                    "probability": [result[k] for k in result if k.startswith("prob_")]
+                })
+                st.dataframe(prob_df, use_container_width=True, hide_index=True)
             else:
-                df = pd.read_excel(uploaded_file)
+                st.warning("Please enter some text to analyze.")
 
-            st.dataframe(df.head(), use_container_width=True)
+    with tab2:
+        st.header("Batch Processing")
 
-            detected_text_col = detect_text_column(df)
-            text_col = st.selectbox(
-                "Pilih kolom teks",
-                df.columns.tolist(),
-                index=df.columns.tolist().index(detected_text_col) if detected_text_col in df.columns else 0
-            )
-            default_task = st.radio("Default task", ["news", "sosmed"], horizontal=True, key="default_task")
-            max_rows = st.number_input("Max rows", min_value=1, max_value=len(df), value=min(100, len(df)))
+        uploaded_file = st.file_uploader(
+            "Upload CSV or Excel file",
+            type=["csv", "xlsx", "xls"],
+            help="File should contain a text column for analysis"
+        )
 
-            if st.button("🚀 Process Batch"):
-                df_proc = df.head(int(max_rows)).copy()
-                df_proc = ensure_task_column(df_proc, default_task)
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
 
-                with st.spinner("Processing batch..."):
-                    result_df = engine.predict_batch(df_proc, text_col=text_col, task_col="task_key")
+                st.success(f"✅ File uploaded successfully! {len(df)} rows found.")
 
-                st.success(f"Selesai memproses {len(result_df)} row.")
-                st.dataframe(result_df, use_container_width=True)
+                with st.expander("📋 Data Preview"):
+                    st.dataframe(df.head(), use_container_width=True)
 
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "💾 Download CSV",
-                    data=csv_bytes,
-                    file_name="batch_inference_results.csv",
-                    mime="text/csv"
+                detected_text_col = detect_text_column(df)
+                text_column = st.selectbox(
+                    "Select text column:",
+                    df.columns,
+                    index=list(df.columns).index(detected_text_col) if detected_text_col in df.columns else 0
                 )
-        except Exception as e:
-            st.error(f"Gagal membaca file: {e}")
+
+                default_task = st.radio("Default task", ["news", "sosmed"], horizontal=True, key="batch_task")
+                max_rows = st.slider("Maximum rows to process:", 1, min(len(df), 500), min(len(df), 50))
+
+                if st.button("🚀 Process Batch", type="primary"):
+                    with st.spinner(f"Processing {max_rows} rows..."):
+                        df_proc = df.head(max_rows).copy()
+                        df_proc = ensure_task_column(df_proc, default_task)
+                        results_df = engine.predict_batch(df_proc, text_col=text_column, task_col="task_key")
+
+                        st.session_state["batch_results"] = results_df
+
+                    st.success("✅ Batch processing completed!")
+
+                if "batch_results" in st.session_state and not st.session_state["batch_results"].empty:
+                    results_df = st.session_state["batch_results"]
+                    st.dataframe(results_df, use_container_width=True)
+
+                    csv_data = results_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="💾 Download Results as CSV",
+                        data=csv_data,
+                        file_name="sentiment_multitask_results.csv",
+                        mime="text/csv"
+                    )
+
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
 
 if __name__ == "__main__":
     main()
