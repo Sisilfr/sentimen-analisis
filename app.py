@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_ID2LABEL = {
-    0: "positif",
+    0: "negatif",
     1: "netral",
-    2: "negatif",
+    2: "positif",
 }
 
 SUPPORTED_TEXT_COLUMNS = [
@@ -403,7 +403,7 @@ class SentimentEngine:
         pred_label = self.id2label.get(pred_idx, str(pred_idx))
         confidence = float(probs[pred_idx].item() * 100.0)
 
-        score_tensor = torch.tensor([5.0, 0.0, -5.0], device=self.bundle.device)
+        score_tensor = torch.tensor([-5.0, 0.0, 5.0], device=self.bundle.device)
         sentiment_score = float(torch.dot(probs, score_tensor).item())
 
         result = {
