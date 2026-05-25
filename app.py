@@ -831,7 +831,6 @@ def main():
 
                 default_task = st.radio("Default task", ["news", "sosmed"], horizontal=True, key="batch_task")
                 max_rows = st.slider("Maximum rows to process:", 1, min(len(df), 500), min(len(df), 50))
-                mc_passes_batch = st.slider("MC Dropout passes (batch)", 3, 9, DEFAULT_MC_PASSES, 2)
 
                 if st.button("🚀 Process Batch", type="primary"):
                     with st.spinner(f"Processing {max_rows} rows..."):
