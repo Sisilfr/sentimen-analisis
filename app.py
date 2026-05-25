@@ -5,9 +5,8 @@ import time
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from urllib.parse import quote
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -18,7 +17,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 # =========================================================
-# BASIC CONFIG
+# STREAMLIT CONFIG
 # =========================================================
 st.set_page_config(
     page_title="Sentiment Analysis Perbankan Indonesia",
@@ -29,8 +28,6 @@ st.set_page_config(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-torch.set_num_threads(1)
-
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_ID2LABEL = {
     0: "positif",
@@ -39,29 +36,20 @@ DEFAULT_ID2LABEL = {
 }
 
 SUPPORTED_TEXT_COLUMNS = [
-    "text", "raw_text", "content", "full_text", "clean_text",
-    "tweet", "caption", "news", "body", "title"
+    "text",
+    "raw_text",
+    "content",
+    "full_text",
+    "clean_text",
+    "tweet",
+    "caption",
+    "news",
+    "body",
+    "title",
 ]
 
 CACHE_ROOT = Path("/tmp/streamlit_mlflow_cache")
 CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-
-# file minimal saja agar first load lebih cepat
-REQUIRED_MODEL_FILES = [
-    "multitask_model.pt",
-]
-OPTIONAL_CONFIG_FILES = [
-    "config_runtime.json",
-]
-OPTIONAL_TOKENIZER_FILES = [
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.txt",
-    "spiece.model",
-    "sentencepiece.bpe.model",
-    "added_tokens.json",
-]
 
 # =========================================================
 # SECRETS
@@ -72,23 +60,29 @@ def get_secret(key: str, default: str = "") -> str:
     except Exception:
         return os.getenv(key, default)
 
+
 def get_required_config() -> Dict[str, str]:
     cfg = {
         "tracking_uri": get_secret("MLFLOW_TRACKING_URI"),
         "dagshub_token": get_secret("DAGSHUB_TOKEN"),
         "dagshub_username": get_secret("DAGSHUB_USERNAME", "token"),
         "run_id": get_secret("MLFLOW_RUN_ID"),
-        "artifact_path": get_secret("MLFLOW_ARTIFACT_PATH", "best_model"),
+        "artifact_path": get_secret("MLFLOW_ARTIFACT_PATH", "model"),
         "base_model_name": get_secret("BASE_MODEL_NAME", "indobenchmark/indobert-base-p1"),
     }
 
-    missing = [k for k, v in cfg.items() if k in {"tracking_uri", "dagshub_token", "run_id"} and not v]
+    missing = [
+        k for k, v in cfg.items()
+        if k in {"tracking_uri", "dagshub_token", "run_id"} and not v
+    ]
     if missing:
         raise ValueError(f"Secrets belum lengkap: {missing}")
+
     return cfg
 
+
 # =========================================================
-# HTTP / MLFLOW REST LIGHT CLIENT
+# MLFLOW / DAGSHUB REST HELPERS
 # =========================================================
 def build_session(username: str, token: str) -> requests.Session:
     s = requests.Session()
@@ -96,14 +90,21 @@ def build_session(username: str, token: str) -> requests.Session:
     s.headers.update({"User-Agent": "streamlit-mlflow-rest-client/1.0"})
     return s
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_run_artifact_base(tracking_uri: str, username: str, token: str, run_id: str) -> str:
-    session = build_session(username, token)
-    url = f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/runs/get"
-    resp = session.get(url, params={"run_id": run_id}, timeout=20)
-    resp.raise_for_status()
-    payload = resp.json()
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_run_artifact_base(
+    tracking_uri: str,
+    username: str,
+    token: str,
+    run_id: str,
+) -> str:
+    session = build_session(username, token)
+
+    url = f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/runs/get"
+    resp = session.get(url, params={"run_id": run_id}, timeout=30)
+    resp.raise_for_status()
+
+    payload = resp.json()
     if "run" not in payload:
         raise RuntimeError(f"Response MLflow invalid: {payload}")
 
@@ -123,6 +124,7 @@ def get_run_artifact_base(tracking_uri: str, username: str, token: str, run_id: 
 
     raise ValueError(f"Format artifact_uri belum didukung: {artifact_uri}")
 
+
 def download_file_if_exists(
     session: requests.Session,
     url: str,
@@ -135,8 +137,14 @@ def download_file_if_exists(
         return True
 
     resp = session.get(url, stream=True, timeout=timeout)
+
     if resp.status_code == 404:
         return False
+
+    # DagsHub kadang balas 500 untuk file yang sebenarnya tidak ada / tidak bisa diresolve
+    if resp.status_code >= 500:
+        return False
+
     resp.raise_for_status()
 
     tmp_path = dst_path.with_suffix(dst_path.suffix + ".part")
@@ -152,8 +160,10 @@ def download_file_if_exists(
     tmp_path.replace(dst_path)
     return True
 
+
 def prepare_model_from_mlflow_rest(force_refresh: bool = False) -> Path:
     cfg = get_required_config()
+
     cache_dir = CACHE_ROOT / cfg["run_id"] / cfg["artifact_path"].strip("/")
     marker = cache_dir / ".ready"
 
@@ -177,45 +187,47 @@ def prepare_model_from_mlflow_rest(force_refresh: bool = False) -> Path:
     artifact_path = cfg["artifact_path"].strip("/")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = []
+    # File wajib sesuai screenshot artifact Anda
+    required_files = [
+        "multitask_model.pt",
+        "config_runtime.json",
+    ]
 
-    # wajib
-    for fname in REQUIRED_MODEL_FILES:
+    # File tokenizer OPTIONAL
+    optional_files = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "vocab.txt",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+        "added_tokens.json",
+        "config.json",
+    ]
+
+    # download wajib
+    for fname in required_files:
         remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
         local_file = cache_dir / fname
-        tasks.append(("required", fname, remote_url, local_file))
-
-    # optional config
-    for fname in OPTIONAL_CONFIG_FILES:
-        remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
-        local_file = cache_dir / fname
-        tasks.append(("optional", fname, remote_url, local_file))
-
-    # tokenizer optional — kalau tidak ada, fallback ke HF
-    for fname in OPTIONAL_TOKENIZER_FILES:
-        remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
-        local_file = cache_dir / fname
-        tasks.append(("tokenizer", fname, remote_url, local_file))
-
-    results = {}
-
-    def _job(kind: str, fname: str, remote_url: str, local_file: Path):
         ok = download_file_if_exists(session, remote_url, local_file)
-        return kind, fname, ok
+        if not ok:
+            raise FileNotFoundError(
+                f"File wajib tidak ditemukan di artifact MLflow: {fname}. "
+                f"Pastikan file ada di path artifact '{artifact_path}'."
+            )
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = [ex.submit(_job, kind, fname, remote_url, local_file) for kind, fname, remote_url, local_file in tasks]
-        for fut in as_completed(futures):
-            kind, fname, ok = fut.result()
-            results[(kind, fname)] = ok
-
-    # validasi file wajib
-    for fname in REQUIRED_MODEL_FILES:
-        if not results.get(("required", fname), False):
-            raise FileNotFoundError(f"File wajib tidak ditemukan di artifact MLflow: {fname}")
+    # download optional, gagal tidak mematikan app
+    for fname in optional_files:
+        try:
+            remote_url = f"{artifact_root_http}/{quote(artifact_path)}/{quote(fname)}"
+            local_file = cache_dir / fname
+            download_file_if_exists(session, remote_url, local_file)
+        except Exception:
+            pass
 
     marker.write_text("ok", encoding="utf-8")
     return cache_dir
+
 
 # =========================================================
 # PREPROCESSING
@@ -251,6 +263,7 @@ class TextPreprocessor:
         text = self.remove_extra_whitespace(text)
         return text
 
+
 # =========================================================
 # MODEL
 # =========================================================
@@ -265,7 +278,11 @@ class MultiTaskIndoBERT(nn.Module):
 
     def forward(self, input_ids, attention_mask, task_name: str):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = outputs.pooler_output if getattr(outputs, "pooler_output", None) is not None else outputs.last_hidden_state[:, 0]
+        pooled = (
+            outputs.pooler_output
+            if getattr(outputs, "pooler_output", None) is not None
+            else outputs.last_hidden_state[:, 0]
+        )
         pooled = self.dropout(pooled)
 
         if task_name == "news":
@@ -275,6 +292,7 @@ class MultiTaskIndoBERT(nn.Module):
         else:
             raise ValueError(f"task_name tidak valid: {task_name}")
 
+
 def safe_read_json(path: Path) -> Dict:
     if path.exists():
         try:
@@ -282,6 +300,7 @@ def safe_read_json(path: Path) -> Dict:
         except Exception as e:
             logger.warning("Gagal membaca json %s: %s", path, e)
     return {}
+
 
 class ModelBundle:
     def __init__(self, model, tokenizer, device, runtime_config, model_dir):
@@ -291,8 +310,10 @@ class ModelBundle:
         self.runtime_config = runtime_config
         self.model_dir = model_dir
 
+
 def load_model_bundle(model_dir: Path) -> ModelBundle:
     cfg = get_required_config()
+
     runtime_config = safe_read_json(model_dir / "config_runtime.json")
     ckpt_path = model_dir / "multitask_model.pt"
 
@@ -305,14 +326,17 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
         or runtime_config.get("pretrained_model_name")
         or cfg["base_model_name"]
     )
+
     num_labels = int(runtime_config.get("num_labels", 3))
     dropout_prob = float(runtime_config.get("dropout_prob", 0.1))
 
-    # tokenizer lokal kalau lengkap, kalau tidak fallback ke base model
+    # tokenizer lokal opsional, fallback ke HF
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+        logger.info("Tokenizer loaded from local artifact folder.")
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(base_model_name, use_fast=False)
+        logger.info("Tokenizer local tidak ada. Fallback ke base model HF: %s", base_model_name)
 
     model = MultiTaskIndoBERT(
         base_model_name=base_model_name,
@@ -338,6 +362,7 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
         model_dir=model_dir,
     )
 
+
 # =========================================================
 # ENGINE
 # =========================================================
@@ -345,6 +370,7 @@ class SentimentEngine:
     def __init__(self, bundle: ModelBundle):
         self.bundle = bundle
         self.preprocessor = TextPreprocessor()
+
         label_map = bundle.runtime_config.get("label_map")
         if isinstance(label_map, dict):
             self.id2label = {int(k): v for k, v in label_map.items()}
@@ -377,7 +403,6 @@ class SentimentEngine:
         pred_label = self.id2label.get(pred_idx, str(pred_idx))
         confidence = float(probs[pred_idx].item() * 100.0)
 
-        # sentiment score
         score_tensor = torch.tensor([5.0, 0.0, -5.0], device=self.bundle.device)
         sentiment_score = float(torch.dot(probs, score_tensor).item())
 
@@ -415,8 +440,9 @@ class SentimentEngine:
 
         return pd.DataFrame(rows)
 
+
 # =========================================================
-# HELPERS UI
+# UI HELPERS
 # =========================================================
 def detect_text_column(df: pd.DataFrame) -> Optional[str]:
     lower_map = {c.lower(): c for c in df.columns}
@@ -424,6 +450,7 @@ def detect_text_column(df: pd.DataFrame) -> Optional[str]:
         if candidate in lower_map:
             return lower_map[candidate]
     return None
+
 
 def ensure_task_column(df: pd.DataFrame, selected_task: str) -> pd.DataFrame:
     out = df.copy()
@@ -434,14 +461,16 @@ def ensure_task_column(df: pd.DataFrame, selected_task: str) -> pd.DataFrame:
         out.loc[~out["task_key"].isin(["news", "sosmed"]), "task_key"] = selected_task
     return out
 
+
 @st.cache_resource(show_spinner=False)
 def load_engine_cached(model_dir_str: str):
     model_dir = Path(model_dir_str)
     bundle = load_model_bundle(model_dir)
     return SentimentEngine(bundle)
 
+
 # =========================================================
-# MAIN UI
+# MAIN APP
 # =========================================================
 def main():
     st.title("🎯 Sentiment Analysis Perbankan Indonesia")
@@ -458,7 +487,9 @@ def main():
                 st.session_state["model_dir"] = str(model_dir)
                 st.session_state["models_loaded"] = True
                 load_engine_cached.clear()
+
             st.sidebar.success(f"✅ Model loaded in {time.time() - t0:.1f}s")
+
         except Exception as e:
             st.sidebar.error(f"❌ Error loading model: {e}")
             st.session_state["models_loaded"] = False
@@ -565,6 +596,7 @@ def main():
 
             except Exception as e:
                 st.error(f"Error reading file: {e}")
+
 
 if __name__ == "__main__":
     main()
