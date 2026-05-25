@@ -7,14 +7,12 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
-import mlflow
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import torch
 import torch.nn as nn
-from mlflow.tracking import MlflowClient
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 # =========================================================
@@ -258,7 +256,7 @@ def load_model_bundle_from_secrets():
 
     tracking_uri = secrets.get("MLFLOW_TRACKING_URI", "")
     run_id = secrets.get("MLFLOW_RUN_ID", "")
-    local_model_dir = secrets.get("LOCAL_MODEL_DIR", "")
+    local_model_dir = secrets.get("LOCAL_MODEL_DIR", ""models/best_model"")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     dagshub_token = secrets.get("DAGSHUB_TOKEN", "")
