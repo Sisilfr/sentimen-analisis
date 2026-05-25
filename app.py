@@ -577,7 +577,7 @@ def main():
                     options=["Satu task untuk semua baris", "Pakai kolom task per baris"],
                     horizontal=True,
                 )
-
+                
                 task_col = None
                 default_task = None
                 if task_mode == "Pakai kolom task per baris":
