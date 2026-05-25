@@ -527,124 +527,109 @@ class SentimentEngine:
         self.task2id = TASK2ID.copy()
         self.max_length = int(bundle.runtime_config.get("resolved_max_length", DEFAULT_MAX_LENGTH))
 
-    @torch.no_grad()
-    def predict_with_mc_dropout_df(
-        self,
-        df: pd.DataFrame,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        mc_passes: int = DEFAULT_MC_PASSES,
-    ) -> pd.DataFrame:
-        all_pass_probs = []
+@torch.no_grad()
+def predict_with_mc_dropout_df(
+    self,
+    df: pd.DataFrame,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    mc_passes: int = DEFAULT_MC_PASSES,
+) -> pd.DataFrame:
+    all_pass_probs = []
 
-        for _ in range(mc_passes):
-            self.bundle.model.train()  # aktifkan dropout
-            pass_probs = []
+    for _ in range(mc_passes):
+        self.bundle.model.train()  # aktifkan dropout
+        pass_probs = []
 
-            for start in range(0, len(df), batch_size):
-                batch_df = df.iloc[start:start + batch_size].copy()
-                texts = batch_df["text"].astype(str).tolist()
-                task_ids = torch.tensor(batch_df["task_id"].tolist(), dtype=torch.long, device=self.bundle.device)
+        for start in range(0, len(df), batch_size):
+            batch_df = df.iloc[start:start + batch_size].copy()
+            texts = batch_df["text"].astype(str).tolist()
+            task_ids = torch.tensor(batch_df["task_id"].tolist(), dtype=torch.long, device=self.bundle.device)
 
-                enc = self.bundle.tokenizer(
-                    texts,
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_length,
-                    return_tensors="pt",
-                )
-                enc = {k: v.to(self.bundle.device) for k, v in enc.items()}
-
-                logits = self.bundle.model(
-                    input_ids=enc["input_ids"],
-                    attention_mask=enc["attention_mask"],
-                    task_ids=task_ids,
-                )
-                probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-                pass_probs.append(probs)
-
-            pass_probs = np.vstack(pass_probs)
-            all_pass_probs.append(pass_probs)
-
-        all_pass_probs = np.stack(all_pass_probs, axis=0)  # [mc_passes, n, 3]
-        mean_probs = all_pass_probs.mean(axis=0)
-        std_probs = all_pass_probs.std(axis=0)
-
-        vote_preds = all_pass_probs.argmax(axis=-1)
-        final_pred_ids = mean_probs.argmax(axis=1)
-
-        agreement = (vote_preds == final_pred_ids[None, :]).mean(axis=0)
-        max_prob = mean_probs.max(axis=1)
-        ent = normalized_entropy(mean_probs)
-        margin = margin_top2(mean_probs)
-
-        out = df.copy()
-        out["pred_id_raw"] = final_pred_ids
-        out["pred_label_raw"] = out["pred_id_raw"].map(ID2LABEL)
-
-        for label_name, label_id in LABEL2ID.items():
-            out[f"prob_{label_name}"] = mean_probs[:, label_id]
-            out[f"std_{label_name}"] = std_probs[:, label_id]
-
-        out["max_prob"] = max_prob
-        out["agreement"] = agreement
-        out["norm_entropy"] = ent
-        out["margin_top2"] = margin
-
-        out["confidence_tier_raw"] = [
-            confidence_tier_from_metrics(mp, ag)
-            for mp, ag in zip(out["max_prob"], out["agreement"])
-        ]
-
-        out["auto_gt_candidate_raw"] = [
-            is_auto_gt_candidate(mp, ag, ne, mg)
-            for mp, ag, ne, mg in zip(
-                out["max_prob"],
-                out["agreement"],
-                out["norm_entropy"],
-                out["margin_top2"],
+            enc = self.bundle.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
             )
-        ]
+            enc = {k: v.to(self.bundle.device) for k, v in enc.items()}
 
-        final_labels = []
-        confidence_tiers = []
-        auto_gt_candidates = []
-
-        for _, row in out.iterrows():
-            final_label = apply_task_post_rule(
-                task_name=row["task_key"],
-                pred_label_raw=row["pred_label_raw"],
-                max_prob=float(row["max_prob"]),
-                agreement=float(row["agreement"]),
-                norm_entropy=float(row["norm_entropy"]),
-                margin=float(row["margin_top2"]),
-                neg_prob=float(row["prob_negatif"]),
-                net_prob=float(row["prob_netral"]),
-                pos_prob=float(row["prob_positif"]),
-                clean_text=str(row["text"]),
+            logits = self.bundle.model(
+                input_ids=enc["input_ids"],
+                attention_mask=enc["attention_mask"],
+                task_ids=task_ids,
             )
-            final_labels.append(final_label)
+            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            pass_probs.append(probs)
 
-            tier = confidence_tier_from_metrics(float(row["max_prob"]), float(row["agreement"]))
-            confidence_tiers.append(tier)
+        pass_probs = np.vstack(pass_probs)
+        all_pass_probs.append(pass_probs)
 
-            candidate = is_auto_gt_candidate(
-                float(row["max_prob"]),
-                float(row["agreement"]),
-                float(row["norm_entropy"]),
-                float(row["margin_top2"]),
-            ) and (final_label == row["pred_label_raw"])
-            auto_gt_candidates.append(candidate)
+    all_pass_probs = np.stack(all_pass_probs, axis=0)
+    mean_probs = all_pass_probs.mean(axis=0)
+    std_probs = all_pass_probs.std(axis=0)
 
-        out["pred_label"] = final_labels
-        out["confidence_tier"] = confidence_tiers
-        out["auto_gt_candidate"] = auto_gt_candidates
-        out["auto_gt_label"] = np.where(out["auto_gt_candidate"], out["pred_label"], "")
+    vote_preds = all_pass_probs.argmax(axis=-1)
+    final_pred_ids = mean_probs.argmax(axis=1)
 
-        score_tensor = np.array([-5.0, 0.0, 5.0], dtype=np.float32)
-        out["sentiment_score"] = (mean_probs * score_tensor[None, :]).sum(axis=1)
+    agreement = (vote_preds == final_pred_ids[None, :]).mean(axis=0)
+    max_prob = mean_probs.max(axis=1)
+    ent = normalized_entropy(mean_probs)
+    margin = margin_top2(mean_probs)
 
-        self.bundle.model.eval()
-        return out
+    out = df.copy()
+    out["pred_id_raw"] = final_pred_ids
+    out["pred_label_raw"] = out["pred_id_raw"].map(ID2LABEL)
+
+    for label_name, label_id in LABEL2ID.items():
+        out[f"prob_{label_name}"] = mean_probs[:, label_id]
+        out[f"std_{label_name}"] = std_probs[:, label_id]
+
+    out["max_prob"] = max_prob
+    out["agreement"] = agreement
+    out["norm_entropy"] = ent
+    out["margin_top2"] = margin
+
+    final_labels = []
+    confidence_tiers = []
+    auto_gt_candidates = []
+
+    for _, row in out.iterrows():
+        final_label = apply_task_post_rule(
+            task_name=row["task_key"],
+            pred_label_raw=row["pred_label_raw"],
+            max_prob=float(row["max_prob"]),
+            agreement=float(row["agreement"]),
+            norm_entropy=float(row["norm_entropy"]),
+            margin=float(row["margin_top2"]),
+            neg_prob=float(row["prob_negatif"]),
+            net_prob=float(row["prob_netral"]),
+            pos_prob=float(row["prob_positif"]),
+            clean_text=str(row["text"]),
+        )
+        final_labels.append(final_label)
+
+        tier = confidence_tier_from_metrics(float(row["max_prob"]), float(row["agreement"]))
+        confidence_tiers.append(tier)
+
+        candidate = is_auto_gt_candidate(
+            float(row["max_prob"]),
+            float(row["agreement"]),
+            float(row["norm_entropy"]),
+            float(row["margin_top2"]),
+        ) and (final_label == row["pred_label_raw"])
+        auto_gt_candidates.append(candidate)
+
+    out["pred_label"] = final_labels
+    out["confidence_tier"] = confidence_tiers
+    out["auto_gt_candidate"] = auto_gt_candidates
+    out["auto_gt_label"] = np.where(out["auto_gt_candidate"], out["pred_label"], "")
+
+    score_tensor = np.array([-5.0, 0.0, 5.0], dtype=np.float32)
+    out["sentiment_score"] = (mean_probs * score_tensor[None, :]).sum(axis=1)
+
+    self.bundle.model.eval()
+    return out
 
     def predict_one(self, text: str, task_name: str, mc_passes: int = DEFAULT_MC_PASSES) -> Dict:
         clean_text = self.preprocessor.clean_text(text)
@@ -673,15 +658,25 @@ class SentimentEngine:
         row["clean_text"] = clean_text
         return row
 
-    def predict_batch(self, df: pd.DataFrame, text_col: str, task_col: str, mc_passes: int = DEFAULT_MC_PASSES) -> pd.DataFrame:
-        proc = df.copy()
-        proc["text"] = proc[text_col].astype(str).map(self.preprocessor.clean_text)
-        proc["task_key"] = proc[task_col].astype(str).str.strip().str.lower()
-        proc["task_key"] = proc["task_key"].where(proc["task_key"].isin(["news", "sosmed"]), "news")
-        proc["task_id"] = proc["task_key"].map(TASK2ID)
+def predict_batch(
+    self,
+    df: pd.DataFrame,
+    text_col: str,
+    task_col: str,
+    mc_passes: int = DEFAULT_MC_PASSES,
+) -> pd.DataFrame:
+    proc = df.copy()
+    proc["text"] = proc[text_col].astype(str).map(self.preprocessor.clean_text)
+    proc["task_key"] = proc[task_col].astype(str).str.strip().str.lower()
+    proc["task_key"] = proc["task_key"].where(proc["task_key"].isin(["news", "sosmed"]), "news")
+    proc["task_id"] = proc["task_key"].map(TASK2ID)
 
-        pred_df = self.predict_with_mc_dropout_df(proc, batch_size=DEFAULT_BATCH_SIZE, mc_passes=mc_passes)
-        return pred_df
+    pred_df = self.predict_with_mc_dropout_df(
+        proc,
+        batch_size=DEFAULT_BATCH_SIZE,
+        mc_passes=mc_passes,
+    )
+    return pred_df
 
 
 # =========================================================
