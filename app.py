@@ -5,17 +5,16 @@ import time
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional
 from urllib.parse import quote
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 
 # =========================================================
 # STREAMLIT CONFIG
@@ -29,26 +28,13 @@ st.set_page_config(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =========================================================
-# REFERENCE CONFIG (sesuai notebook training + inference)
-# =========================================================
-LABEL2ID = {"negatif": 0, "netral": 1, "positif": 2}
-ID2LABEL = {v: k for k, v in LABEL2ID.items()}
-
-TASK2ID = {"news": 0, "sosmed": 1}
-ID2TASK = {v: k for k, v in TASK2ID.items()}
-
-DEFAULT_BASE_MODEL = "indobenchmark/indobert-base-p1"
-DEFAULT_DROPOUT = 0.20
 DEFAULT_MAX_LENGTH = 256
 DEFAULT_BATCH_SIZE = 16
-DEFAULT_MC_PASSES = 7
 
-# selective confidence threshold (sesuai notebook inference)
-AUTO_GT_MIN_CONF = 0.80
-AUTO_GT_MIN_AGREEMENT = 0.80
-AUTO_GT_MAX_NORM_ENTROPY = 0.35
-AUTO_GT_MIN_MARGIN = 0.20
+# Mapping final yang dipakai app
+# Sesuaikan kalau nanti label mapping asli dari training notebook berbeda
+LABEL2ID = {"negatif": 0, "netral": 1, "positif": 2}
+ID2LABEL = {0: "negatif", 1: "netral", 2: "positif"}
 
 SUPPORTED_TEXT_COLUMNS = [
     "text",
@@ -83,7 +69,7 @@ def get_required_config() -> Dict[str, str]:
         "dagshub_username": get_secret("DAGSHUB_USERNAME", "token"),
         "run_id": get_secret("MLFLOW_RUN_ID"),
         "artifact_path": get_secret("MLFLOW_ARTIFACT_PATH", "model"),
-        "base_model_name": get_secret("BASE_MODEL_NAME", DEFAULT_BASE_MODEL),
+        "base_model_name": get_secret("BASE_MODEL_NAME", "indobenchmark/indobert-base-p1"),
     }
 
     missing = [
@@ -97,7 +83,7 @@ def get_required_config() -> Dict[str, str]:
 
 
 # =========================================================
-# DAGSHUB / MLFLOW REST LIGHT CLIENT
+# DAGSHUB / MLFLOW REST HELPERS
 # =========================================================
 def build_session(username: str, token: str) -> requests.Session:
     s = requests.Session()
@@ -156,7 +142,7 @@ def download_file_if_exists(
     if resp.status_code == 404:
         return False
 
-    # DagsHub kadang balas 500 untuk file opsional yang tidak ada
+    # DagsHub kadang balas 500 untuk file opsional
     if resp.status_code >= 500:
         return False
 
@@ -241,7 +227,7 @@ def prepare_model_from_mlflow_rest(force_refresh: bool = False) -> Path:
 
 
 # =========================================================
-# PREPROCESSING (helper-based, bukan dictionary slang)
+# PREPROCESSING
 # =========================================================
 class TextPreprocessor:
     def normalize_unicode(self, text: str) -> str:
@@ -276,57 +262,38 @@ class TextPreprocessor:
 
 
 # =========================================================
-# MODEL SESUAI TRAINING NOTEBOOK
+# MODEL
 # =========================================================
 class MultiTaskIndoBERT(nn.Module):
-    def __init__(
-        self,
-        base_model: str,
-        num_labels: int = 3,
-        task_names=("news", "sosmed"),
-        dropout: float = DEFAULT_DROPOUT,
-    ):
+    """
+    Versi deploy sederhana:
+    shared encoder + 2 classification heads
+    """
+
+    def __init__(self, base_model_name: str, num_labels: int = 3, dropout_prob: float = 0.2):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(base_model)
-        self.encoder = AutoModel.from_pretrained(base_model, config=self.config)
-        hidden_size = self.config.hidden_size
-        self.num_labels = num_labels
+        self.encoder = AutoModel.from_pretrained(base_model_name)
+        hidden_size = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(dropout_prob)
+        self.classifier_news = nn.Linear(hidden_size, num_labels)
+        self.classifier_sosmed = nn.Linear(hidden_size, num_labels)
 
-        self.norm = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.heads = nn.ModuleDict({
-            task: nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, num_labels)
-            )
-            for task in task_names
-        })
-        self.task_id_to_name = {0: "news", 1: "sosmed"}
-
-    def forward(self, input_ids, attention_mask, task_ids):
+    def forward(self, input_ids, attention_mask, task_name: str):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = outputs.last_hidden_state
 
-        mask = attention_mask.unsqueeze(-1).type_as(hidden)
-        mean_pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-        cls_pooled = hidden[:, 0]
+        if getattr(outputs, "pooler_output", None) is not None:
+            pooled = outputs.pooler_output
+        else:
+            pooled = outputs.last_hidden_state[:, 0]
 
-        pooled = 0.5 * cls_pooled + 0.5 * mean_pooled
-        pooled = self.norm(pooled)
         pooled = self.dropout(pooled)
 
-        logits = torch.empty(
-            pooled.size(0),
-            self.num_labels,
-            dtype=torch.float32,
-            device=pooled.device,
-        )
-
-        for task_id, task_name in self.task_id_to_name.items():
-            task_mask = (task_ids == task_id)
-            if task_mask.any():
-                task_logits = self.heads[task_name](pooled[task_mask]).float()
-                logits[task_mask] = task_logits
+        if task_name == "news":
+            logits = self.classifier_news(pooled)
+        elif task_name == "sosmed":
+            logits = self.classifier_sosmed(pooled)
+        else:
+            raise ValueError(f"task_name tidak valid: {task_name}")
 
         return logits
 
@@ -365,7 +332,7 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
         or cfg["base_model_name"]
     )
 
-    dropout_prob = float(runtime_config.get("dropout_prob", runtime_config.get("dropout", DEFAULT_DROPOUT)))
+    dropout_prob = float(runtime_config.get("dropout_prob", runtime_config.get("dropout", 0.2)))
     max_length = int(runtime_config.get("max_length", DEFAULT_MAX_LENGTH))
 
     try:
@@ -376,8 +343,9 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
         logger.info("Tokenizer local tidak ada. Fallback ke base model HF: %s", base_model_name)
 
     model = MultiTaskIndoBERT(
-        base_model=base_model_name,
-        dropout=dropout_prob,
+        base_model_name=base_model_name,
+        num_labels=3,
+        dropout_prob=dropout_prob,
     )
 
     state = torch.load(ckpt_path, map_location="cpu")
@@ -404,55 +372,30 @@ def load_model_bundle(model_dir: Path) -> ModelBundle:
 
 
 # =========================================================
-# MC DROPOUT INFERENCE (sesuai notebook inference)
+# CONFIDENCE / POST RULES
 # =========================================================
-def normalized_entropy(prob_matrix: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    entropy = -np.sum(prob_matrix * np.log(prob_matrix + eps), axis=1)
-    max_entropy = np.log(prob_matrix.shape[1])
-    return entropy / max_entropy
-
-
-def margin_top2(prob_matrix: np.ndarray) -> np.ndarray:
-    sorted_probs = -np.sort(-prob_matrix, axis=1)
-    return sorted_probs[:, 0] - sorted_probs[:, 1]
-
-
-def confidence_tier_from_metrics(max_prob: float, agreement: float) -> str:
-    if (max_prob >= 0.90) and (agreement >= 0.90):
+def compute_confidence_tier(conf_percent: float, margin: float) -> str:
+    if conf_percent >= 80 and margin >= 0.20:
         return "sangat_kuat"
-    if (max_prob >= 0.80) and (agreement >= 0.80):
+    if conf_percent >= 65 and margin >= 0.12:
         return "kuat"
-    if max_prob >= 0.70:
+    if conf_percent >= 55 and margin >= 0.08:
         return "menengah"
-    return "lemah"
+    if conf_percent >= 45 and margin >= 0.05:
+        return "lemah"
+    return "sangat_lemah"
 
 
-def is_auto_gt_candidate(max_prob: float, agreement: float, norm_entropy: float, margin: float) -> bool:
-    return (
-        (max_prob >= AUTO_GT_MIN_CONF) and
-        (agreement >= AUTO_GT_MIN_AGREEMENT) and
-        (norm_entropy <= AUTO_GT_MAX_NORM_ENTROPY) and
-        (margin >= AUTO_GT_MIN_MARGIN)
-    )
-
-
-def apply_task_post_rule(
+def apply_task_rules(
     task_name: str,
     pred_label_raw: str,
-    max_prob: float,
-    agreement: float,
-    norm_entropy: float,
+    confidence: float,
     margin: float,
     neg_prob: float,
     net_prob: float,
     pos_prob: float,
     clean_text: str,
 ) -> str:
-    """
-    Rule deployment konservatif.
-    Tujuannya bukan memalsukan confidence, tapi menahan output ambigu.
-    """
-
     final_label = pred_label_raw
     text = clean_text.lower()
 
@@ -460,57 +403,59 @@ def apply_task_post_rule(
         "anjlok", "melemah", "turun", "krisis", "macet", "mencekik",
         "mahal", "error", "lemot", "keluhan", "ngeluh", "mengeluhkan",
         "gangguan", "phishing", "penipuan", "scam", "rugi", "beban",
-        "likuiditas", "tertekan", "depresiasi", "biaya naik", "saldo hilang"
+        "likuiditas", "tertekan", "depresiasi", "biaya naik", "saldo hilang",
+        "menurun", "terjerat", "kebobolan", "bangkrut"
     ]
 
     neutral_cues = [
         "mengumumkan", "menginformasikan", "informasi", "penyesuaian",
         "rapat umum", "rups", "jadwal", "standar", "kebijakan",
-        "meluncurkan", "merilis", "edukasi", "imbauan", "sosialisasi"
+        "meluncurkan", "merilis", "edukasi", "imbauan", "sosialisasi",
+        "menjelaskan", "menyampaikan"
     ]
 
     has_negative_cue = any(c in text for c in negative_cues)
     has_neutral_cue = any(c in text for c in neutral_cues)
 
     if task_name == "sosmed":
-        if max_prob < 0.55:
+        if confidence < 45:
             return "netral"
-        if agreement < 0.65:
-            return "netral"
-        if margin < 0.10:
-            return "netral"
-        if norm_entropy > 0.60:
+        if margin < 0.08:
             return "netral"
 
         if pred_label_raw == "positif":
-            if pos_prob < 0.58:
+            if confidence < 58:
                 return "netral"
-            if (pos_prob - net_prob) < 0.10:
+            if pos_prob < 0.52:
+                return "netral"
+            if (pos_prob - net_prob) < 0.08:
                 return "netral"
             if has_negative_cue:
                 return "netral"
 
         if pred_label_raw == "negatif":
-            if neg_prob < 0.52 and (neg_prob - net_prob) < 0.08 and not has_negative_cue:
+            if neg_prob < 0.50 and (neg_prob - net_prob) < 0.07 and not has_negative_cue:
                 return "netral"
 
         if has_neutral_cue and net_prob >= 0.32:
             return "netral"
 
     if task_name == "news":
-        if has_neutral_cue and net_prob >= 0.30 and margin < 0.10:
+        if has_neutral_cue and margin < 0.10 and net_prob >= 0.30:
             return "netral"
 
         if pred_label_raw == "positif":
-            if pos_prob < 0.60:
+            if confidence < 60:
                 return "netral"
-            if margin < 0.12:
+            if pos_prob < 0.55:
+                return "netral"
+            if (pos_prob - net_prob) < 0.10:
                 return "netral"
 
-        if pred_label_raw == "negatif" and has_negative_cue and neg_prob >= 0.45:
+        if has_negative_cue and neg_prob >= 0.42:
             return "negatif"
 
-        if net_prob >= 0.33 and margin < 0.08:
+        if net_prob >= 0.34 and margin < 0.07:
             return "netral"
 
     return final_label
@@ -524,159 +469,98 @@ class SentimentEngine:
         self.bundle = bundle
         self.preprocessor = TextPreprocessor()
         self.id2label = ID2LABEL.copy()
-        self.task2id = TASK2ID.copy()
         self.max_length = int(bundle.runtime_config.get("resolved_max_length", DEFAULT_MAX_LENGTH))
 
-@torch.no_grad()
-def predict_with_mc_dropout_df(
-    self,
-    df: pd.DataFrame,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    mc_passes: int = DEFAULT_MC_PASSES,
-) -> pd.DataFrame:
-    all_pass_probs = []
-
-    for _ in range(mc_passes):
-        self.bundle.model.train()  # aktifkan dropout
-        pass_probs = []
-
-        for start in range(0, len(df), batch_size):
-            batch_df = df.iloc[start:start + batch_size].copy()
-            texts = batch_df["text"].astype(str).tolist()
-            task_ids = torch.tensor(batch_df["task_id"].tolist(), dtype=torch.long, device=self.bundle.device)
-
-            enc = self.bundle.tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(self.bundle.device) for k, v in enc.items()}
-
-            logits = self.bundle.model(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-                task_ids=task_ids,
-            )
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-            pass_probs.append(probs)
-
-        pass_probs = np.vstack(pass_probs)
-        all_pass_probs.append(pass_probs)
-
-    all_pass_probs = np.stack(all_pass_probs, axis=0)
-    mean_probs = all_pass_probs.mean(axis=0)
-    std_probs = all_pass_probs.std(axis=0)
-
-    vote_preds = all_pass_probs.argmax(axis=-1)
-    final_pred_ids = mean_probs.argmax(axis=1)
-
-    agreement = (vote_preds == final_pred_ids[None, :]).mean(axis=0)
-    max_prob = mean_probs.max(axis=1)
-    ent = normalized_entropy(mean_probs)
-    margin = margin_top2(mean_probs)
-
-    out = df.copy()
-    out["pred_id_raw"] = final_pred_ids
-    out["pred_label_raw"] = out["pred_id_raw"].map(ID2LABEL)
-
-    for label_name, label_id in LABEL2ID.items():
-        out[f"prob_{label_name}"] = mean_probs[:, label_id]
-        out[f"std_{label_name}"] = std_probs[:, label_id]
-
-    out["max_prob"] = max_prob
-    out["agreement"] = agreement
-    out["norm_entropy"] = ent
-    out["margin_top2"] = margin
-
-    final_labels = []
-    confidence_tiers = []
-    auto_gt_candidates = []
-
-    for _, row in out.iterrows():
-        final_label = apply_task_post_rule(
-            task_name=row["task_key"],
-            pred_label_raw=row["pred_label_raw"],
-            max_prob=float(row["max_prob"]),
-            agreement=float(row["agreement"]),
-            norm_entropy=float(row["norm_entropy"]),
-            margin=float(row["margin_top2"]),
-            neg_prob=float(row["prob_negatif"]),
-            net_prob=float(row["prob_netral"]),
-            pos_prob=float(row["prob_positif"]),
-            clean_text=str(row["text"]),
-        )
-        final_labels.append(final_label)
-
-        tier = confidence_tier_from_metrics(float(row["max_prob"]), float(row["agreement"]))
-        confidence_tiers.append(tier)
-
-        candidate = is_auto_gt_candidate(
-            float(row["max_prob"]),
-            float(row["agreement"]),
-            float(row["norm_entropy"]),
-            float(row["margin_top2"]),
-        ) and (final_label == row["pred_label_raw"])
-        auto_gt_candidates.append(candidate)
-
-    out["pred_label"] = final_labels
-    out["confidence_tier"] = confidence_tiers
-    out["auto_gt_candidate"] = auto_gt_candidates
-    out["auto_gt_label"] = np.where(out["auto_gt_candidate"], out["pred_label"], "")
-
-    score_tensor = np.array([-5.0, 0.0, 5.0], dtype=np.float32)
-    out["sentiment_score"] = (mean_probs * score_tensor[None, :]).sum(axis=1)
-
-    self.bundle.model.eval()
-    return out
-
-    def predict_one(self, text: str, task_name: str, mc_passes: int = DEFAULT_MC_PASSES) -> Dict:
+    def predict_one(self, text: str, task_name: str) -> Dict:
         clean_text = self.preprocessor.clean_text(text)
 
-        df = pd.DataFrame([
-            {
-                "text": clean_text,
-                "task_key": task_name,
-                "task_id": TASK2ID[task_name],
-            }
-        ])
-
-        pred_df = self.predict_with_mc_dropout_df(df, batch_size=1, mc_passes=mc_passes)
-        row = pred_df.iloc[0].to_dict()
-
-        row["token_length"] = int(
-            len(
-                self.bundle.tokenizer.encode(
-                    clean_text,
-                    truncation=True,
-                    max_length=self.max_length
-                )
-            )
+        encoded = self.bundle.tokenizer(
+            clean_text,
+            max_length=self.max_length,
+            truncation=True,
+            padding=False,
+            return_tensors="pt",
         )
-        row["raw_text"] = text
-        row["clean_text"] = clean_text
-        return row
 
-def predict_batch(
-    self,
-    df: pd.DataFrame,
-    text_col: str,
-    task_col: str,
-    mc_passes: int = DEFAULT_MC_PASSES,
-) -> pd.DataFrame:
-    proc = df.copy()
-    proc["text"] = proc[text_col].astype(str).map(self.preprocessor.clean_text)
-    proc["task_key"] = proc[task_col].astype(str).str.strip().str.lower()
-    proc["task_key"] = proc["task_key"].where(proc["task_key"].isin(["news", "sosmed"]), "news")
-    proc["task_id"] = proc["task_key"].map(TASK2ID)
+        input_ids = encoded["input_ids"].to(self.bundle.device)
+        attention_mask = encoded["attention_mask"].to(self.bundle.device)
 
-    pred_df = self.predict_with_mc_dropout_df(
-        proc,
-        batch_size=DEFAULT_BATCH_SIZE,
-        mc_passes=mc_passes,
-    )
-    return pred_df
+        with torch.no_grad():
+            logits = self.bundle.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                task_name=task_name,
+            )
+
+        probs = F.softmax(logits, dim=-1).squeeze(0)
+        prob_values = probs.detach().cpu().numpy().tolist()
+
+        pred_idx = int(torch.argmax(probs).item())
+        pred_label_raw = self.id2label.get(pred_idx, str(pred_idx))
+        confidence = float(probs[pred_idx].item() * 100.0)
+
+        sorted_indices = torch.argsort(probs, descending=True)
+        top1_idx = int(sorted_indices[0].item())
+        top2_idx = int(sorted_indices[1].item())
+        top1_prob = float(probs[top1_idx].item())
+        top2_prob = float(probs[top2_idx].item())
+        margin = top1_prob - top2_prob
+
+        neg_prob = prob_values[0]
+        net_prob = prob_values[1]
+        pos_prob = prob_values[2]
+
+        pred_label_final = apply_task_rules(
+            task_name=task_name,
+            pred_label_raw=pred_label_raw,
+            confidence=confidence,
+            margin=margin,
+            neg_prob=neg_prob,
+            net_prob=net_prob,
+            pos_prob=pos_prob,
+            clean_text=clean_text,
+        )
+
+        confidence_tier = compute_confidence_tier(confidence, margin)
+
+        # referensi Anda memakai sentiment score [5, 0, -5] untuk positive-neutral-negative.
+        # Karena mapping app ini negatif-netral-positif, bobot dibalik jadi [-5, 0, 5].
+        score_tensor = torch.tensor([-5.0, 0.0, 5.0], device=self.bundle.device)
+        sentiment_score = float(torch.dot(probs, score_tensor).item())
+
+        return {
+            "task_key": task_name,
+            "raw_text": text,
+            "clean_text": clean_text,
+            "pred_label": pred_label_final,
+            "pred_label_raw": pred_label_raw,
+            "confidence": round(confidence, 4),
+            "confidence_tier": confidence_tier,
+            "sentiment_score": round(sentiment_score, 4),
+            "token_length": int(input_ids.shape[1]),
+            "margin": round(margin, 6),
+            "prob_negatif": round(float(neg_prob), 6),
+            "prob_netral": round(float(net_prob), 6),
+            "prob_positif": round(float(pos_prob), 6),
+        }
+
+    def predict_batch(self, df: pd.DataFrame, text_col: str, task_col: str) -> pd.DataFrame:
+        rows = []
+        for _, row in df.iterrows():
+            text = row.get(text_col, "")
+            if pd.isna(text):
+                continue
+
+            task_name = str(row.get(task_col, "news")).strip().lower()
+            if task_name not in {"news", "sosmed"}:
+                task_name = "news"
+
+            pred = self.predict_one(str(text), task_name)
+            item = row.to_dict()
+            item.update(pred)
+            rows.append(item)
+
+        return pd.DataFrame(rows)
 
 
 # =========================================================
@@ -712,6 +596,7 @@ def load_engine_cached(model_dir_str: str):
 # =========================================================
 def main():
     st.title("🎯 Sentiment Analysis Perbankan Indonesia")
+
     st.sidebar.header("🔧 Model Configuration")
 
     if st.sidebar.button("🔄 Load / Reload Model"):
@@ -751,51 +636,39 @@ def main():
             placeholder="Tempel teks berita atau teks sosmed di sini...",
             height=140
         )
-        mc_passes = st.slider("MC Dropout passes", 3, 9, DEFAULT_MC_PASSES, 2)
 
         if st.button("🔍 Analyze", type="primary"):
             if input_text.strip():
                 with st.spinner("Processing..."):
-                    result = engine.predict_one(input_text, task_name, mc_passes=mc_passes)
+                    result = engine.predict_one(input_text, task_name)
 
                 st.subheader("🔸 Model Results")
-                c1, c2, c3 = st.columns(3)
+                c1, c2 = st.columns(2)
 
                 with c1:
                     st.metric("Final Label", result["pred_label"])
                     st.metric("Raw Label", result["pred_label_raw"])
-                    st.metric("Confidence (max_prob)", f"{float(result['max_prob']) * 100:.2f}%")
+                    st.metric("Confidence", f"{result['confidence']:.2f}%")
 
                 with c2:
-                    st.metric("Agreement", f"{float(result['agreement']) * 100:.2f}%")
-                    st.metric("Norm Entropy", f"{float(result['norm_entropy']):.4f}")
-                    st.metric("Margin Top-2", f"{float(result['margin_top2']):.4f}")
-
-                with c3:
                     st.metric("Confidence Tier", result["confidence_tier"])
-                    st.metric("Auto-GT Candidate", "YES" if bool(result["auto_gt_candidate"]) else "NO")
+                    st.metric("Margin", f"{result['margin']:.4f}")
                     st.metric("Token Length", result["token_length"])
 
-                st.write("### Probability Mean (MC Dropout)")
+                st.write("### Probability")
                 prob_df = pd.DataFrame({
                     "label": ["negatif", "netral", "positif"],
                     "probability": [
-                        float(result["prob_negatif"]),
-                        float(result["prob_netral"]),
-                        float(result["prob_positif"]),
-                    ],
-                    "std": [
-                        float(result["std_negatif"]),
-                        float(result["std_netral"]),
-                        float(result["std_positif"]),
+                        result["prob_negatif"],
+                        result["prob_netral"],
+                        result["prob_positif"],
                     ],
                 })
                 st.dataframe(prob_df, use_container_width=True, hide_index=True)
 
                 st.write("### Detail")
                 st.json({
-                    "sentiment_score": float(result["sentiment_score"]),
-                    "auto_gt_label": result["auto_gt_label"],
+                    "sentiment_score": result["sentiment_score"],
                     "clean_text": result["clean_text"],
                 })
             else:
@@ -840,7 +713,6 @@ def main():
                             df_proc,
                             text_col=text_column,
                             task_col="task_key",
-                            mc_passes=mc_passes_batch,
                         )
                         st.session_state["batch_results"] = results_df
 
@@ -864,23 +736,17 @@ def main():
                     st.write("### Hasil Batch")
                     display_cols = [c for c in [
                         text_column,
-                        "text",
+                        "clean_text",
                         "task_key",
                         "pred_label",
                         "pred_label_raw",
-                        "max_prob",
-                        "agreement",
-                        "norm_entropy",
-                        "margin_top2",
+                        "confidence",
                         "confidence_tier",
-                        "auto_gt_candidate",
-                        "auto_gt_label",
+                        "margin",
+                        "token_length",
                         "prob_negatif",
                         "prob_netral",
                         "prob_positif",
-                        "std_negatif",
-                        "std_netral",
-                        "std_positif",
                         "sentiment_score",
                     ] if c in results_df.columns]
 
@@ -890,7 +756,7 @@ def main():
                     st.download_button(
                         label="💾 Download Results as CSV",
                         data=csv_data,
-                        file_name="sentiment_multitask_mc_dropout_results.csv",
+                        file_name="sentiment_multitask_results.csv",
                         mime="text/csv"
                     )
 
