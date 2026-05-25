@@ -474,8 +474,6 @@ def load_engine_cached(model_dir_str: str):
 # =========================================================
 def main():
     st.title("🎯 Sentiment Analysis Perbankan Indonesia")
-    st.markdown("Inference model IndoBERT multitask multisource untuk **news** dan **sosmed**.")
-    st.markdown("Model diambil dari MLflow/DagsHub via **Streamlit secrets**, tanpa menampilkan token atau run_id.")
 
     st.sidebar.header("🔧 Model Configuration")
 
