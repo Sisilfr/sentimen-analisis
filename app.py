@@ -305,7 +305,6 @@ def build_input_df(df: pd.DataFrame, text_col: str, task_col: Optional[str], def
 
 def render_header():
     st.title("🎯 Sentiment Analysis Multitask")
-    st.markdown("Analisis sentimen **news** dan **sosmed** menggunakan model multitask IndoBERT yang dimuat dari **MLflow**.")
 
 
 def render_sidebar(bundle: Dict):
